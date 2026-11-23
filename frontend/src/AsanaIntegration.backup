@@ -1,0 +1,287 @@
+import { useEffect, useState } from 'react';
+import { Link2, RefreshCw, Unplug, FolderKanban, Download } from 'lucide-react';
+
+type AsanaStatus = {
+  connected: boolean;
+  account?: { asana_user_name?: string | null } | null;
+};
+
+type AsanaProject = {
+  gid: string;
+  name: string;
+  workspace_gid?: string;
+  workspace_name?: string;
+  imported?: boolean;
+  local_project_id?: string | null;
+  last_synced_at?: string | null;
+};
+
+type ProjectInsight = {
+  id: string;
+  name: string;
+  health_score: number;
+  risk_level: 'Low' | 'Medium' | 'High';
+  total_tasks: number;
+  completed_tasks: number;
+  ml_prediction?: string;
+  ml_confidence?: number;
+  recommendations?: string[];
+};
+
+async function readJson(response: Response): Promise<any> {
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(body?.error || `Request failed (${response.status})`);
+  }
+  return body;
+}
+
+type AsanaIntegrationProps = {
+  onSyncComplete?: () => void;
+};
+
+export default function AsanaIntegration({ onSyncComplete }: AsanaIntegrationProps) {
+  const [status, setStatus] = useState<AsanaStatus | null>(null);
+  const [projects, setProjects] = useState<AsanaProject[]>([]);
+  const [projectInsights, setProjectInsights] = useState<Record<string, ProjectInsight>>({});
+  const [loading, setLoading] = useState(true);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [importingId, setImportingId] = useState<string | null>(null);
+  const [success, setSuccess] = useState('');
+  const [error, setError] = useState('');
+  const [insightsError, setInsightsError] = useState('');
+
+  async function loadStatus() {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await fetch('/api/asana/status', { credentials: 'include' });
+      const data = (await readJson(response)) as AsanaStatus;
+      setStatus(data);
+      if (!data.connected) {
+        setProjects([]);
+        setProjectInsights({});
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to check Asana connection');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadProjectInsights() {
+    const response = await fetch('/api/insights', { credentials: 'include' });
+    const data = (await readJson(response)) as ProjectInsight[];
+    if (!Array.isArray(data)) throw new Error('Unexpected AI insights response');
+    const byId: Record<string, ProjectInsight> = {};
+    for (const insight of data) byId[insight.id] = insight;
+    setProjectInsights(byId);
+    setInsightsError('');
+  }
+
+  async function loadProjects() {
+    setProjectsLoading(true);
+    setError('');
+    try {
+      const response = await fetch('/api/asana/projects', { credentials: 'include' });
+      const data = await readJson(response);
+      if (!Array.isArray(data.projects)) throw new Error('Unexpected Asana projects response');
+      setProjects(data.projects as AsanaProject[]);
+      try {
+        await loadProjectInsights();
+      } catch (err) {
+        setInsightsError(err instanceof Error ? err.message : 'Unable to load AI insights');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load Asana projects');
+    } finally {
+      setProjectsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  function connectAsana() {
+    window.location.href = '/api/asana/connect';
+  }
+
+  async function disconnectAsana() {
+    if (!window.confirm('Disconnect your Asana account?')) return;
+    setBusy(true);
+    setError('');
+    setSuccess('');
+    try {
+      const response = await fetch('/api/asana/disconnect', {
+        method: 'POST',
+        credentials: 'include'
+      });
+      await readJson(response);
+      setProjects([]);
+      setProjectInsights({});
+      await loadStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to disconnect Asana');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importProject(gid: string, name: string) {
+    if (!window.confirm(`Import or sync "${name}" with ProjectHealth AI?`)) return;
+    setImportingId(gid);
+    setError('');
+    setSuccess('');
+    try {
+      const response = await fetch(`/api/asana/projects/${encodeURIComponent(gid)}/import`, {
+        method: 'POST',
+        credentials: 'include'
+      });
+      const data = await readJson(response);
+      const warning = data.analysis_updated === false
+        ? ' AI analysis could not be refreshed on the backend.'
+        : '';
+      // The import has already succeeded. A display refresh failure must not
+      // make the successful import look like a failed operation.
+      setSuccess(
+        `Successfully imported/synced "${name}". New tasks: ${data.created_tasks ?? 0}, ` +
+        `updated tasks: ${data.updated_tasks ?? 0}.${warning}`
+      );
+      await loadProjects();
+      onSyncComplete?.();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Project import or sync failed');
+    } finally {
+      setImportingId(null);
+    }
+  }
+
+  return (
+    <div style={{ padding: '24px', maxWidth: '900px' }}>
+      <h1>Asana Integration</h1>
+      <p>Connect your Asana account, synchronize projects, and view AI risk analysis.</p>
+
+      <div className="card" style={{ padding: '24px', marginTop: '24px' }}>
+        <h2>Asana Account</h2>
+        {loading ? (
+          <p>Checking connection...</p>
+        ) : (
+          <>
+            <p><strong>Status:</strong> {status?.connected ? 'Connected' : 'Not Connected'}</p>
+            {status?.connected && status.account?.asana_user_name && (
+              <p><strong>Account:</strong> {status.account.asana_user_name}</p>
+            )}
+            {status?.connected ? (
+              <button className="secondary" onClick={() => void disconnectAsana()}
+                disabled={busy || importingId !== null}>
+                <Unplug size={16} /> Disconnect
+              </button>
+            ) : (
+              <button onClick={connectAsana} disabled={busy}>
+                <Link2 size={16} /> Connect to Asana
+              </button>
+            )}
+          </>
+        )}
+        <div style={{ marginTop: '20px' }}>
+          <button className="secondary" onClick={() => void loadStatus()}
+            disabled={loading || busy || importingId !== null}>
+            <RefreshCw size={16} /> Refresh Status
+          </button>
+        </div>
+      </div>
+
+      {success && <p role="status" style={{ color: 'green', marginTop: '16px' }}>{success}</p>}
+      {error && <p role="alert" style={{ color: 'crimson', marginTop: '16px' }}>{error}</p>}
+
+      {status?.connected && (
+        <div className="card" style={{ padding: '24px', marginTop: '24px' }}>
+          <h2>Asana Projects</h2>
+          <p>Import or sync projects and see their latest AI risk assessments.</p>
+          <button onClick={() => void loadProjects()}
+            disabled={projectsLoading || busy || importingId !== null}>
+            <FolderKanban size={16} /> {projectsLoading ? 'Loading...' : 'View Asana Projects'}
+          </button>
+          {insightsError && (
+            <p role="alert" style={{ color: 'crimson' }}>
+              Projects loaded, but AI results are unavailable: {insightsError}
+            </p>
+          )}
+
+          {projects.length > 0 && (
+            <div style={{ marginTop: '20px' }}>
+              {projects.map(project => {
+                const insight = project.local_project_id
+                  ? projectInsights[project.local_project_id]
+                  : undefined;
+                const riskColor = insight?.risk_level === 'High'
+                  ? '#b42318'
+                  : insight?.risk_level === 'Medium'
+                    ? '#9a6700'
+                    : '#16703c';
+                return (
+                  <div key={project.gid} style={{
+                    padding: '16px', border: '1px solid #ddd',
+                    borderRadius: '8px', marginBottom: '12px'
+                  }}>
+                    <h3>{project.name}</h3>
+                    <p><strong>Workspace:</strong> {project.workspace_name || 'Unknown'}</p>
+                    <p><strong>Asana Project ID:</strong> {project.gid}</p>
+                    <p><strong>Sync Status:</strong> {project.imported ? '✅ Synced' : '⚪ Not Imported'}</p>
+                    <p>
+                      <strong>Last Synced:</strong>{' '}
+                      {project.last_synced_at
+                        ? new Date(project.last_synced_at).toLocaleString('en-AU', {
+                            timeZone: 'Australia/Sydney',
+                            dateStyle: 'medium', timeStyle: 'short'
+                          })
+                        : 'Never'}
+                    </p>
+                    {insight && (
+                      <div style={{
+                        margin: '12px 0', padding: '16px',
+                        border: '1px solid #ddd', borderRadius: '8px'
+                      }}>
+                        <h4>AI Risk Analysis</h4>
+                        <p><strong>Health Score:</strong> {insight.health_score}/100</p>
+                        <p><strong>Risk Level:</strong>{' '}
+                          <span style={{ color: riskColor, fontWeight: 700 }}>{insight.risk_level}</span>
+                        </p>
+                        <p><strong>Tasks Completed:</strong> {insight.completed_tasks}/{insight.total_tasks}</p>
+                        <p><strong>ML Prediction:</strong> {insight.ml_prediction ?? 'Not available'}</p>
+                        <p><strong>ML Confidence:</strong>{' '}
+                          {insight.ml_confidence != null ? `${insight.ml_confidence}%` : 'Not available'}
+                        </p>
+                        {insight.recommendations && insight.recommendations.length > 0 && (
+                          <div>
+                            <strong>Recommendations:</strong>
+                            <ul>
+                              {insight.recommendations.map((recommendation, index) => (
+                                <li key={index}>{recommendation}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <button className="secondary"
+                      onClick={() => void importProject(project.gid, project.name)}
+                      disabled={importingId !== null || busy || projectsLoading}>
+                      <Download size={16} />{' '}
+                      {importingId === project.gid ? 'Processing...' : 'Import / Sync Project'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {!projectsLoading && projects.length === 0 && (
+            <p style={{ marginTop: '16px' }}>Click View Asana Projects to load your projects.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
